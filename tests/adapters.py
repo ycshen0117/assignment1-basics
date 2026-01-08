@@ -314,7 +314,32 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    device, dtype = in_features.device, in_features.dtype
+    model = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=device,
+        dtype=dtype,
+    )
+    model.load_state_dict({
+        'attention.qkv_proj.weight': torch.cat([
+            weights['attn.q_proj.weight'],
+            weights['attn.k_proj.weight'],
+            weights['attn.v_proj.weight'],
+        ], dim=0),
+        'attention.o_proj.weight': weights['attn.output_proj.weight'],
+        'rmsnorm1.scale': weights['ln1.weight'],
+        'ffn.linear1.weight': weights['ffn.w1.weight'],
+        'ffn.linear2.weight': weights['ffn.w2.weight'],
+        'ffn.linear3.weight': weights['ffn.w3.weight'],
+        'rmsnorm2.scale': weights['ln2.weight'],
+    })
+    B, S, _ = in_features.shape
+    positions = torch.arange(S, device=device).expand(B, S) 
+    return model(in_features, token_positions=positions)
 
 
 def run_transformer_lm(
@@ -397,7 +422,41 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    device, dtype = in_indices.device, weights['token_embeddings.weight'].dtype
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        num_layers=num_layers,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        theta=rope_theta,
+        device=device,
+        dtype=dtype,
+    )
+    # Load state dict
+    state_dict = {
+        'token_embedding.weight': weights['token_embeddings.weight'],
+        'rmsnorm.scale': weights['ln_final.weight'],
+        'lm_head.weight': weights['lm_head.weight'],
+    }
+    for layer_idx in range(num_layers):
+        prefix = f'layers.{layer_idx}.'
+        state_dict.update({
+            f'blocks.{layer_idx}.attention.qkv_proj.weight': torch.cat([
+                weights[prefix + 'attn.q_proj.weight'],
+                weights[prefix + 'attn.k_proj.weight'],
+                weights[prefix + 'attn.v_proj.weight'],
+            ], dim=0),
+            f'blocks.{layer_idx}.attention.o_proj.weight': weights[prefix + 'attn.output_proj.weight'],
+            f'blocks.{layer_idx}.rmsnorm1.scale': weights[prefix + 'ln1.weight'],
+            f'blocks.{layer_idx}.ffn.linear1.weight': weights[prefix + 'ffn.w1.weight'],
+            f'blocks.{layer_idx}.ffn.linear2.weight': weights[prefix + 'ffn.w2.weight'],
+            f'blocks.{layer_idx}.ffn.linear3.weight': weights[prefix + 'ffn.w3.weight'],
+            f'blocks.{layer_idx}.rmsnorm2.scale': weights[prefix + 'ln2.weight'],
+        })
+    model.load_state_dict(state_dict)
+    return model(in_indices)
 
 
 def run_rmsnorm(

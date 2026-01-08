@@ -69,6 +69,10 @@ def silu(x: torch.Tensor) -> torch.Tensor:
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        """
+        d_model: input and output dimension
+        d_ff: hidden dimension, approximately d_model * 8 / 3
+        """
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.linear1 = Linear(d_model, d_ff, **factory_kwargs)
@@ -124,7 +128,7 @@ def scaled_dot_product_attention(
     scores = einsum(Q, K, "... q d, ... k d -> ... q k") * (d_k ** -0.5)
     if mask is not None:
         scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-    attn = torch.softmax(scores, dim=-1)
+    attn = softmax(scores, dim=-1) # dim=-1 means over the d_model dimension
     return einsum(attn, V, "... q k, ... k d -> ... q d")
 
 
@@ -179,3 +183,84 @@ class CausalMultiHeadSelfAttention(nn.Module):
         attn = scaled_dot_product_attention(q, k, v, mask=mask)
         out = rearrange(attn, "... h seq d -> ... seq (h d)")
         return self.o_proj(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float = 10000.0,
+        eps: float = 1e-5,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.attention = CausalMultiHeadSelfAttention(
+            d_model, num_heads, max_seq_len, theta, **factory_kwargs
+        )
+        self.rmsnorm1 = RMSNorm(d_model, eps, **factory_kwargs)
+        self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
+        self.rmsnorm2 = RMSNorm(d_model, eps, **factory_kwargs)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        x: torch.Tensor of shape (..., sequence_length, d_model)
+        return: torch.Tensor of shape (..., sequence_length, d_model)
+        """
+        y = x + self.attention(self.rmsnorm1(x), token_positions)
+        result = y + self.ffn(self.rmsnorm2(y))
+        return result
+    
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float = 10000.0,
+        eps: float = 1e-5,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.token_embedding = Embedding(vocab_size, d_model, **factory_kwargs)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    max_seq_len = context_length,
+                    theta = theta,
+                    eps = eps,
+                    **factory_kwargs,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.rmsnorm = RMSNorm(d_model, eps, **factory_kwargs)
+        self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
+
+    def forward(self, token_ids: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        token_ids: torch.Tensor of shape (..., sequence_length)
+        return: torch.Tensor of shape (..., sequence_length, vocab_size)
+        """
+        x = self.token_embedding(token_ids)
+        if token_positions is None:
+            token_positions = torch.arange(token_ids.shape[-1], device=token_ids.device)
+        for block in self.blocks:
+            x = block(x, token_positions)
+        x = self.rmsnorm(x)
+        return self.lm_head(x)
