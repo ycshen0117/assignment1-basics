@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from einops import rearrange, einsum, repeat
+from einops import rearrange, einsum
 
 
 class Linear(nn.Module):
