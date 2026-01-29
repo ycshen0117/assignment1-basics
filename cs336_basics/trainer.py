@@ -1,12 +1,19 @@
-import argparse
-import os
 import time
+from pathlib import Path
 
+import hydra
 import numpy as np
 import torch
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
+from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.model import TransformerLM
 from cs336_basics.optimizer import AdamW, cross_entropy, gradient_clipping, learning_rate_schedule
+from cs336_basics.generate import generate
+from cs336_basics.logger import Logger
+from cs336_basics.config import TrainConfig
 
 
 def data_loading(
@@ -25,6 +32,23 @@ def data_loading(
     return x_batch, y_batch
 
 
+def compute_entropy_chunked(logits:torch.Tensor, chunk_size:int=128) -> torch.Tensor:
+    """Memory-efficient implementation of `compute_entropy`."""
+    num_chunks = (logits.shape[1] + chunk_size - 1) // chunk_size
+    entropy_chunks = []
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, logits.shape[1])
+        chunk_logits = logits[:, start_idx:end_idx, :]
+        
+        # Use the numerically stable method for torch.bfloat16, do not use logsumexp
+        chunk_probs = chunk_logits.softmax(dim=-1)
+        chunk_log_probs = chunk_logits.log_softmax(dim=-1)
+        chunk_entropy = -(chunk_probs * chunk_log_probs).sum(dim=-1)
+        entropy_chunks.append(chunk_entropy)
+    return torch.cat(entropy_chunks, dim=1)
+
+
 def save_checkpoint(model, optimizer, iteration, out):
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -41,201 +65,159 @@ def load_checkpoint(src, model, optimizer):
     return checkpoint["iteration"]
 
 
-def _load_dataset(path: str, dtype: str, fmt: str) -> np.ndarray:
-    if fmt == "npy":
-        return np.load(path, mmap_mode="r")
-    return np.memmap(path, dtype=np.dtype(dtype), mode="r")
-
-
-def _resolve_checkpoint_path(base_path: str, iteration: int) -> str:
-    if base_path.endswith(os.sep) or os.path.isdir(base_path):
-        os.makedirs(base_path, exist_ok=True)
-        return os.path.join(base_path, f"ckpt_{iteration}.pt")
-    os.makedirs(os.path.dirname(base_path) or ".", exist_ok=True)
-    return base_path
-
-
-def _maybe_init_wandb(args):
-    if not args.use_wandb:
-        return None
-    try:
-        import wandb
-    except ImportError:
-        print("wandb not installed; skipping external logging.")
-        return None
-    return wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config=vars(args),
-    )
-
-
-def evaluate(
-    model: torch.nn.Module,
-    data: np.ndarray,
-    batch_size: int,
-    context_length: int,
-    device: str,
-    batches: int,
-) -> float:
+@torch.no_grad()
+def evaluate(model:TransformerLM, data, cfg: TrainConfig, device):
+    """
+    Estimates the loss over a number of batches.
+    """
     model.eval()
-    total_loss = 0.0
-    with torch.inference_mode():
-        for _ in range(batches):
-            x_batch, y_batch = data_loading(data, batch_size, context_length, device)
-            logits = model(x_batch)
-            loss = cross_entropy(logits, y_batch)
-            total_loss += loss.item()
+    losses = []
+    entropies = []
+    for _ in tqdm(range(cfg.training.eval_iters), desc="Evaluating", leave=False):
+        x, y = data_loading(data, cfg.training.batch_size, cfg.model.context_length, device)
+        logits = model(x)
+        loss = cross_entropy(logits, y)
+        losses.append(loss.item())
+        entropies.append(compute_entropy_chunked(logits).mean().item())
     model.train()
-    return total_loss / max(batches, 1)
+    mean_loss = np.mean(losses)
+    return {
+        'val/loss': mean_loss,
+        'val/ppl': np.exp(mean_loss),
+        'val/entropy': np.mean(entropies)
+    }
 
 
-def main() -> None:
-    # Argument parsing
-    parser = argparse.ArgumentParser(description="Train a TransformerLM on tokenized data.")
-    parser.add_argument("--train-data", required=True, help="Path to training tokens.")
-    parser.add_argument("--val-data", default=None, help="Path to validation tokens.")
-    parser.add_argument("--data-format", choices=["memmap", "npy"], default="memmap")
-    parser.add_argument("--data-dtype", default="int32")
-    parser.add_argument("--checkpoint-path", required=True)
-    parser.add_argument("--resume-from", default=None)
-    parser.add_argument("--log-interval", type=int, default=100)
-    parser.add_argument("--eval-interval", type=int, default=500)
-    parser.add_argument("--eval-batches", type=int, default=50)
-    parser.add_argument("--checkpoint-interval", type=int, default=1000)
-    parser.add_argument("--max-iters", type=int, default=10000)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--context-length", type=int, default=128)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--seed", type=int, default=1337)
+def setup(cfg: TrainConfig):
+    if cfg.optimizer.min_lr is None:
+        cfg.optimizer.min_lr = cfg.optimizer.max_lr * 0.1
+    if cfg.training.eval_interval is None:
+        cfg.training.eval_interval = cfg.training.max_iters // 10
+    if cfg.training.max_iters is None:
+        cfg.training.max_iters = 327_680_000 // cfg.training.batch_size // cfg.model.context_length
+    if cfg.optimizer.warmup_iters is None:
+        cfg.optimizer.warmup_iters = cfg.training.max_iters // 10
 
-    parser.add_argument("--vocab-size", type=int, required=True)
-    parser.add_argument("--num-layers", type=int, default=4)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--d-ff", type=int, default=1024)
-    parser.add_argument("--theta", type=float, default=10000.0)
-    parser.add_argument("--eps", type=float, default=1e-5)
 
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--min-lr", type=float, default=3e-5)
-    parser.add_argument("--warmup-iters", type=int, default=200)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--beta1", type=float, default=0.9)
-    parser.add_argument("--beta2", type=float, default=0.999)
-    parser.add_argument("--adam-eps", type=float, default=1e-8)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+@hydra.main(config_path="conf", config_name="train_config", version_base=None)
+def main(cfg: TrainConfig) -> None:
+    """
+    Main training loop managed by Hydra.
+    """
+    # --- Setup ---
+    setup(cfg)
 
-    parser.add_argument("--use-wandb", action="store_true")
-    parser.add_argument("--wandb-project", default="cs336-basics")
-    parser.add_argument("--wandb-run-name", default=None)
+    logger = Logger(cfg)
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    print(f"Output directory: {output_dir}")
+    print("Configuration:\n", OmegaConf.to_yaml(cfg, resolve=True))
 
-    args = parser.parse_args()
+    torch.manual_seed(cfg.training.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.cuda.empty_cache()
+    print(f"Using device: {device}")
 
-    # Set random seeds
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # --- Data Loading ---
+    print("Loading data...")
+    data_path = Path(cfg.data.path)
+    train_data = np.memmap(data_path / 'train.bin', dtype=np.uint16, mode='r')
+    val_data = np.memmap(data_path / 'val.bin', dtype=np.uint16, mode='r')
+    print(f"Train data size: {len(train_data)}, Val data size: {len(val_data)}")
 
-    # Pick device and load datasets
-    device = torch.device(args.device)
-    train_data = _load_dataset(args.train_data, args.data_dtype, args.data_format)
-    val_data = None
-    if args.val_data:
-        val_data = _load_dataset(args.val_data, args.data_dtype, args.data_format)
-
-    # Initialize model and optimizer
-    model = TransformerLM(
-        vocab_size=args.vocab_size,
-        context_length=args.context_length,
-        num_layers=args.num_layers,
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        d_ff=args.d_ff,
-        theta=args.theta,
-        eps=args.eps,
-        device=device,
-    )
-
+    # --- Model and Optimizer ---
+    model = TransformerLM(**cfg.model).to(device)
+    if cfg.training.is_compile :
+        model = torch.compile(model)
+    
     optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.weight_decay,
+        model.parameters(), 
+        lr=cfg.optimizer.max_lr, 
+        betas=cfg.optimizer.betas, 
+        weight_decay=cfg.optimizer.weight_decay,
+        eps=cfg.optimizer.eps
     )
-
-    # Resume from a checkpoint
+    
     start_iter = 0
-    if args.resume_from:
-        start_iter = load_checkpoint(args.resume_from, model, optimizer)
+    # --- Checkpoint Loading ---
+    if cfg.training.resume_from:
+        print(f"Resuming from checkpoint: {cfg.training.resume_from}")
+        start_iter = load_checkpoint(cfg.training.resume_from, model, optimizer)
+        print(f"Resumed from iteration {start_iter}")
 
-    # Initialize Weights & Biases logging
-    run = _maybe_init_wandb(args)
-
-    # Training loop
-    model.train()
+    # --- Training Loop ---
+    print("Starting training...")
     start_time = time.time()
+    for it in tqdm(range(start_iter, cfg.training.max_iters), desc="Training"):
+        # Learning rate schedule
+        lr = learning_rate_schedule(it, cfg.optimizer.max_lr, cfg.optimizer.min_lr, cfg.optimizer.warmup_iters, cfg.training.max_iters)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-    for iteration in range(start_iter, args.max_iters):
-        lr = learning_rate_schedule(
-            iteration,
-            alpha_max=args.lr,
-            alpha_min=args.min_lr,
-            T_w=args.warmup_iters,
-            T_c=args.max_iters,
-        )
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+        # Get a batch of data
+        x, y = data_loading(train_data, cfg.training.batch_size, cfg.model.context_length, device)
 
-        # Sample a random training batch
-        x_batch, y_batch = data_loading(train_data, args.batch_size, args.context_length, args.device)
+        # Forward pass
+        logits = model(x)
+        loss = cross_entropy(logits, y)
 
-        # Forward pass + loss
-        logits = model(x_batch)
-        loss = cross_entropy(logits, y_batch)
-        
-        # Backward pass + optimization step
+        # Backward pass and optimization
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        if args.grad_clip > 0:
-            gradient_clipping(model.parameters(), args.grad_clip)
+        
+        # Gradient Clipping
+        grad_norm = gradient_clipping(model.parameters(), max_l2_norm=1.0)
+
         optimizer.step()
 
-        # Periodic logging (console + wandb)
-        if iteration % args.log_interval == 0:
-            elapsed = time.time() - start_time
-            tokens = args.batch_size * args.context_length * max(1, iteration - start_iter + 1)
-            tps = tokens / max(elapsed, 1e-6)
-            msg = f"iter {iteration} | loss {loss.item():.4f} | lr {lr:.2e} | tok/s {tps:.1f}"
-            print(msg)
-            if run is not None:
-                run.log({"train/loss": loss.item(), "lr": lr, "tokens_per_s": tps}, step=iteration)
-
-        # Periodic evaluation on validation set
-        if val_data is not None and iteration % args.eval_interval == 0 and iteration != start_iter:
-            val_loss = evaluate(
-                model,
-                val_data,
-                args.batch_size,
-                args.context_length,
-                args.device,
-                args.eval_batches,
-            )
-            print(f"iter {iteration} | val_loss {val_loss:.4f}")
-            if run is not None:
-                run.log({"val/loss": val_loss}, step=iteration)
-
-        # Periodic checkpointing
-        if args.checkpoint_interval > 0 and iteration % args.checkpoint_interval == 0:
-            ckpt_path = _resolve_checkpoint_path(args.checkpoint_path, iteration)
-            save_checkpoint(model, optimizer, iteration, ckpt_path)
+        # --- Logging ---
+        if it % cfg.training.log_interval == 0 or it == cfg.training.max_iters - 1:
+            duration = time.time() - start_time
+            ent = compute_entropy_chunked(logits).mean()
+            tqdm.write(f"Iter {it}: Train loss={loss.item():.4f}, LR={lr:.6f}, Time={duration:.2f}s")
+            logger.log_metrics({
+                'train/loss': loss.item(), 
+                'train/ppl': loss.exp().item(),
+                'train/lr': lr,
+                'train/entropy': ent.item(),
+                'train/grad_norm': grad_norm
+            }, step=it)
+            
+        # --- Evaluation and Checkpointing ---
+        if it > 0 and (it % cfg.training.eval_interval == 0 or it == cfg.training.max_iters - 1):
+            metrics = evaluate(model, val_data, cfg, device)
+            tqdm.write(f"Iter {it}: Val loss={metrics['val/loss']:.4f}")
+            logger.log_metrics(metrics, step=it)
+            
+            if cfg.training.save_ckpt:
+                checkpoint_path = output_dir / f'ckpt_{it}.pt'
+                tqdm.write(f"Saving checkpoint to {checkpoint_path}")
+                save_checkpoint(model, optimizer, it, checkpoint_path)
     
-    # Final checkpoint at the end of training
-    ckpt_path = _resolve_checkpoint_path(args.checkpoint_path, args.max_iters)
-    save_checkpoint(model, optimizer, args.max_iters, ckpt_path)
-
-    if run is not None:
-        run.finish()
+    tqdm.write("Training finished.")
+    
+    # --- Generation ---
+    tokenizer_path = cfg.data.tokenizer_path
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    print("Beginning generation...")
+    if cfg.training.is_compile:
+        model = model._orig_mod # unwrap compiled model
+    generated_output = tokenizer.decode(
+        generate(
+            model, 
+            context, 
+            max_new_tokens=1000, 
+            block_size=cfg.model.context_length,
+            temperature=0.6,
+            top_p=0.95
+        )[0].tolist()
+    )    
+    tqdm.write("\n--- Generated Text ---")
+    tqdm.write(generated_output)
+    # Log generated text
+    logger.log_text("Generated Text", generated_output, step=cfg.training.max_iters)
+    logger.close()
+    OmegaConf.save(cfg, output_dir / 'config.yaml')
 
 
 if __name__ == "__main__":
