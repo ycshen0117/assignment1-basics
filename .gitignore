@@ -168,6 +168,4 @@ outputs/
 
 tensorboard/
 
-tests/
-
 cs336_basics/pretokenization_example.py
