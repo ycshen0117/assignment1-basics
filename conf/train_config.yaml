@@ -1,0 +1,8 @@
+defaults:
+  - _self_
+  - hydra: default
+  - data: default
+  - model: default
+  - optimizer: default
+  - training: default
+  - logger: tensorboard

@@ -209,23 +209,33 @@ class Tokenizer:
 
 
     @classmethod
-    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
-        # Load vocab (assumed to be a JSON file: {token_id: byte_string})
-        with open(vocab_filepath, 'r', encoding='utf-8') as vf:
-            vocab_data = json.load(vf)
-            # Optional: convert keys to int if stored as strings
-            vocab = {int(k): bytes(v, 'latin1') if isinstance(v, str) else bytes(v) 
-                     for k, v in vocab_data.items()}
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None) -> "Tokenizer":
+        """
+        Construct a Tokenizer from serialized vocabulary and merges files.
 
-        # Load merges (assumed to be a list of pairs like: "a b")
-        with open(merges_filepath, 'r', encoding='utf-8') as mf:
-            lines = mf.readlines()
-            # Optional: skip headers like "#version: 0.2"
-            merge_pairs = [tuple(line.strip().split()) for line in lines if not line.startswith('#') and line.strip()]
-            # Convert to byte-pairs
-            merges = [(a.encode('utf-8'), b.encode('utf-8')) for a, b in merge_pairs]
+        Args:
+            vocab_filepath (str): Path to the vocabulary file (from BPE training).
+            merges_filepath (str): Path to the merges file (from BPE training).
+            special_tokens (list[str] | None): Optional list of special tokens to include.
+
+        Returns:
+            Tokenizer: A Tokenizer instance initialized with the given files.
+        """
+        vocab: dict[int, bytes] = {}
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                id_str, token_str = line.strip().split("\t")
+                vocab[int(id_str)] = eval(token_str).encode("utf-8")
+
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    merges.append((eval(parts[0]).encode("utf-8"), eval(parts[1]).encode("utf-8")))
 
         return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
     
     def encode(self, text: str) -> list[int]:
         chunks = split_by_special(text, self.special_tokens, drop_special=False)

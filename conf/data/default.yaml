@@ -1,0 +1,2 @@
+path: data/tinystories
+tokenizer_path: hf_tokenizer/tinystories/tokenizer.json

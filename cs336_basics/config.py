@@ -19,12 +19,7 @@ class ModelConfig:
     num_layers: int = 4
     num_heads: int = 16
     d_ff: int = 1344  # From model/default.yaml
-    rope_theta: float = 10000.0
-    # Ablation study parameters
-    ffn_type: str = 'swiglu' # 'swiglu' or 'silu'
-    use_post_norm: bool = False
-    remove_rmsnorm: bool = False
-    remove_rope: bool = False
+    theta: float = 10000.0
 
 @dataclass
 class OptimizerConfig:
@@ -45,7 +40,7 @@ class TrainingConfig:
     batch_size: int = 256
     max_iters: Optional[int] = None # 5000
     log_interval: int = 10
-    eval_interval: int = 500
+    eval_interval: Optional[int] = None
     eval_iters: int = 200
     resume_from: Optional[str] = None
     out_dir: str = "outputs" # From training/default.yaml

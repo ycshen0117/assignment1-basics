@@ -5,64 +5,18 @@ import hydra
 import numpy as np
 import torch
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from cs336_basics.tokenizer import Tokenizer
+from tokenizers import Tokenizer
 from cs336_basics.model import TransformerLM
-from cs336_basics.optimizer import AdamW, cross_entropy, gradient_clipping, learning_rate_schedule
+from cs336_basics.optimizer import AdamW
 from cs336_basics.generate import generate
 from cs336_basics.logger import Logger
 from cs336_basics.config import TrainConfig
-
-
-def data_loading(
-    x: np.ndarray, batch_size: int, context_length: int, device: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x_tensor = torch.as_tensor(x, dtype=torch.long)
-    num_possible_starting_indices = x_tensor.shape[0] - context_length
-    starts = torch.randint(0, num_possible_starting_indices, (batch_size,), dtype=torch.long)
-    offsets = torch.arange(context_length, dtype=torch.long)
-    idx = starts[:, None] + offsets[None, :]
-    x_batch = x_tensor[idx]
-    y_batch = x_tensor[idx + 1]
-    if device != "cpu":
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
-    return x_batch, y_batch
-
-
-def compute_entropy_chunked(logits:torch.Tensor, chunk_size:int=128) -> torch.Tensor:
-    """Memory-efficient implementation of `compute_entropy`."""
-    num_chunks = (logits.shape[1] + chunk_size - 1) // chunk_size
-    entropy_chunks = []
-    for i in range(num_chunks):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, logits.shape[1])
-        chunk_logits = logits[:, start_idx:end_idx, :]
-        
-        # Use the numerically stable method for torch.bfloat16, do not use logsumexp
-        chunk_probs = chunk_logits.softmax(dim=-1)
-        chunk_log_probs = chunk_logits.log_softmax(dim=-1)
-        chunk_entropy = -(chunk_probs * chunk_log_probs).sum(dim=-1)
-        entropy_chunks.append(chunk_entropy)
-    return torch.cat(entropy_chunks, dim=1)
-
-
-def save_checkpoint(model, optimizer, iteration, out):
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "iteration": iteration,
-    }
-    torch.save(checkpoint, out)
-
-
-def load_checkpoint(src, model, optimizer):
-    checkpoint = torch.load(src)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint["iteration"]
+from cs336_basics.data import data_loading
+from cs336_basics.checkpoint import save_checkpoint, load_checkpoint
+from cs336_basics.utils import *
 
 
 @torch.no_grad()
@@ -88,32 +42,25 @@ def evaluate(model:TransformerLM, data, cfg: TrainConfig, device):
     }
 
 
-def setup(cfg: TrainConfig):
-    if cfg.optimizer.min_lr is None:
-        cfg.optimizer.min_lr = cfg.optimizer.max_lr * 0.1
-    if cfg.training.eval_interval is None:
-        cfg.training.eval_interval = cfg.training.max_iters // 10
-    if cfg.training.max_iters is None:
-        cfg.training.max_iters = 327_680_000 // cfg.training.batch_size // cfg.model.context_length
-    if cfg.optimizer.warmup_iters is None:
-        cfg.optimizer.warmup_iters = cfg.training.max_iters // 10
-
-
-@hydra.main(config_path="conf", config_name="train_config", version_base=None)
+@hydra.main(config_path="../conf", config_name="train_config", version_base=None)
 def main(cfg: TrainConfig) -> None:
     """
     Main training loop managed by Hydra.
     """
-    # --- Setup ---
-    setup(cfg)
-
     logger = Logger(cfg)
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     print(f"Output directory: {output_dir}")
     print("Configuration:\n", OmegaConf.to_yaml(cfg, resolve=True))
 
     torch.manual_seed(cfg.training.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    
     torch.cuda.empty_cache()
     print(f"Using device: {device}")
 
@@ -165,7 +112,7 @@ def main(cfg: TrainConfig) -> None:
         loss.backward()
         
         # Gradient Clipping
-        grad_norm = gradient_clipping(model.parameters(), max_l2_norm=1.0)
+        grad_norm = gradient_clipping(model.parameters(), max_l2_norm=cfg.optimizer.max_l2_norm)
 
         optimizer.step()
 

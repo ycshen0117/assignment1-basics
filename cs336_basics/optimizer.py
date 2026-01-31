@@ -1,21 +1,5 @@
 import torch
 import torch.optim as optim
-import math
-from einops import rearrange
-from collections.abc import Iterable
-
-def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """
-    Compute average cross-entropy loss for logits with arbitrary leading batch dims.
-    """
-    flat_logits = rearrange(logits, "... v -> (...) v")
-    flat_targets = rearrange(targets, "... -> (...)")
-
-    max_logits = flat_logits.max(dim=-1, keepdim=True).values
-    shifted = flat_logits - max_logits
-    log_sum_exp = torch.log(torch.exp(shifted).sum(dim=-1))
-    target_logits = shifted.gather(-1, flat_targets.unsqueeze(-1)).squeeze(-1)
-    return (log_sum_exp - target_logits).mean()
 
 
 class AdamW(optim.Optimizer):
@@ -79,28 +63,3 @@ class AdamW(optim.Optimizer):
                 param.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
-    
-
-def learning_rate_schedule(current_step: int, alpha_max: float, alpha_min: float, T_w: int, T_c: int) -> float:
-    if current_step < T_w:
-        return alpha_max * (current_step / T_w)
-    elif current_step <= T_c:
-        cos_inner = (math.pi * (current_step - T_w)) / (T_c - T_w)
-        return alpha_min + 0.5 * (alpha_max - alpha_min) * (1 + math.cos(cos_inner))
-    else:
-        return alpha_min
-    
-
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, epsilon: float = 1e-6) -> None:
-    params = [param for param in parameters if param.grad is not None]
-    if not params:
-        return
-    total_norm_sq = torch.zeros((), device=params[0].grad.device, dtype=params[0].grad.dtype)
-    for param in params:
-        grad = param.grad.detach()
-        total_norm_sq.add_(grad.pow(2).sum())
-    total_norm = total_norm_sq.sqrt()
-    clip_coef = max_l2_norm / (total_norm + epsilon)
-    clip_coef = torch.clamp(clip_coef, max=1.0)
-    for param in params:
-        param.grad.mul_(clip_coef)

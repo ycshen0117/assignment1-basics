@@ -162,4 +162,12 @@ cython_debug/
 .ruff_cache/
 *.zip
 
-data/
+/data/
+
+outputs/
+
+tensorboard/
+
+tests/
+
+cs336_basics/pretokenization_example.py
