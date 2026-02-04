@@ -5,4 +5,4 @@ defaults:
   - model: default
   - optimizer: default
   - training: default
-  - logger: tensorboard
+  - logger: wandb

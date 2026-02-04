@@ -169,3 +169,5 @@ outputs/
 tensorboard/
 
 cs336_basics/pretokenization_example.py
+
+/wandb/
